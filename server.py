@@ -3,39 +3,51 @@ import logging
 from asyncua import Server
 from device_instance import DeviceInstance
 
-logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
-logging.getLogger('asyncua.server.address_space').setLevel(logging.WARNING)
 
 OPCUA_PORT = 4840
 UPDATE_INTERVAL = 5
 
-# Импорт конфигурации устройств
 from devices import DEVICES
-#from moq.devices import DEVICES
+
+
+def setup_logging():
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    file_handler = logging.FileHandler("server.log", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", "%H:%M:%S"
+    ))
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s", "%H:%M:%S"
+    ))
+
+    root.handlers = [file_handler, console_handler]
+    logging.getLogger('asyncua.server.address_space').setLevel(logging.WARNING)
+
 
 class OpcUaServer:
-    """Основной сервер с поддержкой динамического добавления устройств"""
-
     def __init__(self):
         self.server = None
-        self.devices: dict[str, DeviceInstance] = {}  # { device_id: DeviceInstance }
+        self.devices: dict[str, DeviceInstance] = {}
 
     async def setup(self):
-        """Инициализация сервера и всех включённых устройств"""
         self.server = Server()
         await self.server.init()
         self.server.set_endpoint(f"opc.tcp://0.0.0.0:{OPCUA_PORT}/")
 
-        # Регистрация пространства имён
         namespace_idx = await self.server.register_namespace(
             "https://examples.freeopcua.github.io/"
         )
 
-        # Создаём устройства только если они enabled
         for device_id, device_config in DEVICES.items():
             if not device_config.get("enabled", True):
-                _logger.info(f"Устройство {device_id} отключено в конфиге — пропускаем")
+                _logger.info(f"Device {device_id} disabled in config - skipping")
                 continue
 
             try:
@@ -47,33 +59,35 @@ class OpcUaServer:
                 )
                 await device.initialize()
                 self.devices[device_id] = device
-                _logger.info(f"Устройство инициализировано: {device_id}")
+                _logger.info(f"Device initialized: {device_id}")
             except Exception as e:
-                _logger.error(f"Ошибка инициализации устройства {device_id}: {e}")
+                _logger.error(f"Device init error {device_id}: {e}")
 
-        _logger.info(f"Сервер запущен на opc.tcp://0.0.0.0:{OPCUA_PORT}/")
-        _logger.info(f"Активных устройств: {len(self.devices)}")
+        _logger.info(f"Server started on opc.tcp://0.0.0.0:{OPCUA_PORT}/")
+        _logger.info(f"Active devices: {len(self.devices)}")
 
     async def update_loop(self):
-        """Цикл опроса всех устройств"""
         iteration = 0
         while True:
             iteration += 1
-            _logger.debug(f"Цикл обновления #{iteration}")
+            _logger.debug(f"Update cycle #{iteration}")
 
             for device_id, device in self.devices.items():
                 try:
+                    if not await device.health_check():
+                        _logger.warning(f"[{device_id}] Health check failed, recreating client")
+                        await device._recreate_client()
+                        continue
                     await device.update_parameters()
                 except Exception as e:
-                    _logger.error(f"[{device_id}] Критическая ошибка в update_parameters: {e}")
-                    continue  # Не останавливаем другие устройства
+                    _logger.error(f"[{device_id}] Critical error in update_parameters: {e}")
+                    continue
 
-            _logger.info(f"Цикл завершён | Устройств: {len(self.devices)} | "
-                         f"Всего узлов: {sum(len(d.nodes) for d in self.devices.values())}")
+            _logger.info(f"Cycle completed | Devices: {len(self.devices)} | "
+                         f"Total nodes: {sum(len(d.nodes) for d in self.devices.values())}")
             await asyncio.sleep(UPDATE_INTERVAL)
 
     async def run(self):
-        """Точка входа"""
         await self.setup()
 
         async with self.server:
@@ -82,13 +96,14 @@ class OpcUaServer:
                 while True:
                     await asyncio.sleep(1)
             except asyncio.CancelledError:
-                _logger.info("Остановка сервера...")
+                _logger.info("Stopping server...")
                 update_task.cancel()
                 await update_task
 
 
 if __name__ == "__main__":
+    setup_logging()
     try:
         asyncio.run(OpcUaServer().run())
     except KeyboardInterrupt:
-        print("\nСервер остановлен пользователем.")
+        print("\nServer stopped by user.")

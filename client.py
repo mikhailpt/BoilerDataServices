@@ -4,52 +4,30 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
 import threading
-
-from asyncua import Client, ua
-
 import logging
 
-# ---------------------------------------------------------------------------
-# Логирование
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+from asyncua import Client, ua
+from db_manager import init_db, recreate_connection, DBConnection
+
 logger = logging.getLogger(__name__)
 
 
-# ===========================================================================
-# ОБРАБОТЧИК ПОДПИСОК
-# ===========================================================================
-
 class OPCDataHandler:
-    """
-    Callback-обработчик OPC UA подписок.
-
-    Получает уведомления об изменении значений и записывает их
-    в таблицу readings (device_param_id, value, server_timestamp).
-
-    param_cache: dict  str(node.nodeid) → device_param_id (int)
-    """
-
-    def __init__(self, db_conn: sqlite3.Connection, param_cache: Dict[str, int]):
+    def __init__(self, db_conn: DBConnection, param_cache: Dict[str, int], db_path: str):
         self.db_conn = db_conn
         self.cursor = db_conn.cursor()
         self._cache = param_cache
         self._lock = threading.Lock()
+        self._db_path = db_path
 
     def datachange_notification(self, node, val, data):
         node_id_str = str(node.nodeid)
 
         if node_id_str not in self._cache:
-            logger.debug(f"Неизвестный узел, пропускаем: {node_id_str}")
+            logger.debug(f"Unknown node, skipping: {node_id_str}")
             return
 
         param_id = self._cache[node_id_str]
-
-        # Серверная метка времени из OPC UA DataValue
         server_ts = _extract_server_timestamp(data)
 
         with self._lock:
@@ -61,19 +39,30 @@ class OPCDataHandler:
                 )
                 self.db_conn.commit()
                 logger.info(f"  {node_id_str} = {val!r}  [{server_ts}]")
-            except sqlite3.Error as e:
-                logger.error(f"Ошибка записи в БД: {e}")
+            except sqlite3.OperationalError as e:
+                logger.error(f"DB operational error: {e}")
                 self.db_conn.rollback()
+                self._recreate_db_connection()
+            except sqlite3.DatabaseError as e:
+                logger.error(f"DB database error: {e}")
+                self.db_conn.rollback()
+                self._recreate_db_connection()
+            except sqlite3.Error as e:
+                logger.error(f"DB write error: {e}")
+                self.db_conn.rollback()
+
+    def _recreate_db_connection(self):
+        try:
+            self.db_conn = recreate_connection(self.db_conn)
+            self.cursor = self.db_conn.cursor()
+            logger.info("DB connection recreated")
+        except Exception as e:
+            logger.error(f"Failed to recreate DB connection: {e}")
 
 
 def _extract_server_timestamp(data) -> str:
-    """
-    Извлекает ServerTimestamp из OPC UA MonitoredItemNotification.
-    Поле data.Value — это ua.DataValue; data.Value.ServerTimestamp — datetime.
-    При недоступности возвращает текущее UTC-время клиента.
-    """
     try:
-        dv = data.Value                              # ua.DataValue
+        dv = data.Value
         ts = dv.ServerTimestamp or dv.SourceTimestamp
         if ts:
             return ts.isoformat()
@@ -82,44 +71,30 @@ def _extract_server_timestamp(data) -> str:
     return datetime.now(ZoneInfo('Asia/Novosibirsk')).isoformat()
 
 
-# ===========================================================================
-# КЛИЕНТ ОДНОГО OPC UA СЕРВЕРА
-# ===========================================================================
-
 class OPCUAServerClient:
-    """
-    Подключается к одному OPC UA серверу.
-
-    Для каждого прибора из devices_config:
-      1. Ищет объект прибора в пространстве Objects по object_name.
-      2. Обходит все дочерние Variable-узлы (browsing).
-      3. Регистрирует прибор и его параметры в БД.
-      4. Подписывается на изменения найденных узлов.
-    """
-
     def __init__(
         self,
-        db_conn: sqlite3.Connection,
+        db_conn: DBConnection,
         server_id: int,
         server_url: str,
         devices_config: List[dict],
         sampling_ms: int = 1000,
+        db_path: str = "opc_readings.db",
     ):
         self.db_conn = db_conn
         self.server_id = server_id
         self.server_url = server_url
-        self.devices_config = devices_config   # [{"key":…, "object_name":…, "description":…}, …]
+        self.devices_config = devices_config
         self.sampling_ms = sampling_ms
+        self.db_path = db_path
         self.client: Optional[Client] = None
         self._subscription = None
         self._running = False
-
-    # -----------------------------------------------------------------------
-    # Регистрация в БД
-    # -----------------------------------------------------------------------
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._reconnect_backoff = 5
+        self._max_backoff = 60
 
     def _upsert_device(self, device_key: str, object_name: str, description: Optional[str]) -> int:
-        """INSERT OR IGNORE прибора, возвращает его id."""
         cur = self.db_conn.cursor()
         cur.execute(
             "INSERT OR IGNORE INTO devices"
@@ -133,14 +108,10 @@ class OPCUAServerClient:
             (self.server_id, device_key),
         )
         device_id = cur.fetchone()[0]
-        logger.info(f"  [БД] Прибор: {device_key} → id={device_id}")
+        logger.info(f"  [DB] Device: {device_key} -> id={device_id}")
         return device_id
 
     def _upsert_device_param(self, device_id: int, info: dict) -> int:
-        """
-        Возвращает id параметра: создаёт новый, если не существует,
-        или возвращает существующий. НЕ меняет id при повторных запусках.
-        """
         cur = self.db_conn.cursor()
 
         cur.execute(
@@ -167,14 +138,11 @@ class OPCUAServerClient:
         row = cur.fetchone()
         if not row:
             raise RuntimeError(
-                f"Не удалось получить id для device_id={device_id}, node_id={info['node_id']}"
+                f"Failed to get id for device_id={device_id}, node_id={info['node_id']}"
             )
 
-        return row[0]  # Возвращаем стабильный id
+        return row[0]
 
-    # -----------------------------------------------------------------------
-    # OPC UA: поиск и обход узлов прибора
-    # -----------------------------------------------------------------------
     async def _find_device_object(self, object_name: str):
         objects_node = self.client.nodes.objects
         return await self._recursive_search(objects_node, object_name, max_depth=10)
@@ -190,13 +158,11 @@ class OPCUAServerClient:
 
         for child in children:
             try:
-                # Проверяем текущий узел
                 bn = await child.read_browse_name()
                 if bn.Name == object_name:
-                    logger.debug(f"  Найдено на глубине {current_depth + 1}: {bn.Name}")
+                    logger.debug(f"  Found at depth {current_depth + 1}: {bn.Name}")
                     return child
 
-                # Рекурсивно ищем в детях (если это Object или Variable)
                 node_class = await child.read_node_class()
                 if node_class in (ua.NodeClass.Object, ua.NodeClass.Variable):
                     found = await self._recursive_search(
@@ -211,19 +177,12 @@ class OPCUAServerClient:
         return None
 
     async def _browse_device_nodes(self, device_obj) -> List[dict]:
-        """
-        Обходит все Variable-узлы прибора (только HasComponent, не свойства).
-        Для каждого считывает: node_id, param_name, description, unit, data_type.
-        Возвращает список dict с ключом 'node' (объект asyncua.Node).
-        """
-        # Пробуем получить только Variable-дочерние узлы через HasComponent
         try:
             children = await device_obj.get_children(
                 refs=ua.ObjectIds.HasComponent,
                 nodeclassmask=ua.NodeClass.Variable,
             )
         except Exception:
-            # Fallback: берём всех детей и фильтруем по NodeClass
             all_children = await device_obj.get_children()
             children = []
             for ch in all_children:
@@ -243,8 +202,6 @@ class OPCUAServerClient:
                 unit: Optional[str] = None
                 data_type_str: str = "string"
 
-                # Свойства узла: Description и EngineeringUnits
-                # (добавляются в device_instance.py через node.add_property)
                 try:
                     props = await node.get_properties()
                     for prop in props:
@@ -257,7 +214,6 @@ class OPCUAServerClient:
                 except Exception:
                     pass
 
-                # Тип данных из текущего значения узла
                 try:
                     val = await node.read_value()
                     data_type_str = type(val).__name__
@@ -266,7 +222,7 @@ class OPCUAServerClient:
 
                 result.append(
                     {
-                        "node": node,               # объект Node для подписки
+                        "node": node,
                         "node_id": node_id_str,
                         "param_name": bn.Name,
                         "description": description,
@@ -274,52 +230,40 @@ class OPCUAServerClient:
                         "data_type": data_type_str,
                     }
                 )
-                logger.debug(f"    Найден узел: {bn.Name}  node_id={node_id_str}")
+                logger.debug(f"    Found node: {bn.Name}  node_id={node_id_str}")
 
             except Exception as e:
-                logger.warning(f"    Не удалось обработать узел: {e}")
+                logger.warning(f"    Node processing error: {e}")
 
         return result
 
-    # -----------------------------------------------------------------------
-    # Запуск / остановка
-    # -----------------------------------------------------------------------
-
     async def start(self):
-        """
-        1. Подключается к серверу.
-        2. Для каждого прибора: browsing → регистрация в БД.
-        3. Создаёт подписку на все найденные узлы.
-        """
         self.client = Client(self.server_url)
         await self.client.connect()
-        logger.info(f"Подключено к серверу: {self.server_url}")
+        logger.info(f"Connected to server: {self.server_url}")
 
-        param_cache: Dict[str, int] = {}    # node_id_str → device_param_id
-        subscribe_nodes: List = []          # Node-объекты для подписки
+        param_cache: Dict[str, int] = {}
+        subscribe_nodes: List = []
 
         for dev_cfg in self.devices_config:
             key = dev_cfg["key"]
             obj_name = dev_cfg["object_name"]
             desc = dev_cfg.get("description")
 
-            logger.info(f"  Обход прибора: {key!r}  (OPC UA объект: {obj_name!r})")
+            logger.info(f"  Browsing device: {key!r}  (OPC UA object: {obj_name!r})")
 
-            # 1. Найти объект прибора на сервере
             device_obj = await self._find_device_object(obj_name)
             if device_obj is None:
                 logger.warning(
-                    f"  Объект {obj_name!r} не найден на {self.server_url} — пропускаем"
+                    f"  Object {obj_name!r} not found on {self.server_url} - skipping"
                 )
                 continue
 
-            # 2. Обойти все Variable-узлы прибора
             nodes_info = await self._browse_device_nodes(device_obj)
             if not nodes_info:
-                logger.warning(f"  Узлы для {key!r} не найдены — пропускаем")
+                logger.warning(f"  No nodes for {key!r} - skipping")
                 continue
 
-            # 3. Зарегистрировать прибор и параметры в БД
             device_id = self._upsert_device(key, obj_name, desc)
 
             for info in nodes_info:
@@ -327,14 +271,13 @@ class OPCUAServerClient:
                 param_cache[info["node_id"]] = param_id
                 subscribe_nodes.append(info["node"])
 
-            logger.info(f"  {key}: зарегистрировано {len(nodes_info)} узлов")
+            logger.info(f"  {key}: registered {len(nodes_info)} nodes")
 
         if not subscribe_nodes:
-            logger.warning(f"Нет узлов для подписки на {self.server_url}")
+            logger.warning(f"No nodes to subscribe on {self.server_url}")
             return
 
-        # 4. Создать подписку и подписаться на все найденные узлы
-        handler = OPCDataHandler(self.db_conn, param_cache)
+        handler = OPCDataHandler(self.db_conn, param_cache, self.db_path)
         self._subscription = await self.client.create_subscription(
             self.sampling_ms, handler
         )
@@ -345,30 +288,72 @@ class OPCUAServerClient:
                 await self._subscription.subscribe_data_change(node)
                 ok_count += 1
             except Exception as e:
-                logger.error(f"  Ошибка подписки на {node.nodeid}: {e}")
+                logger.error(f"  Subscribe error on {node.nodeid}: {e}")
 
         logger.info(
-            f"Сервер {self.server_url}: подписки активны"
-            f" ({ok_count}/{len(subscribe_nodes)} узлов)"
+            f"Server {self.server_url}: subscriptions active"
+            f" ({ok_count}/{len(subscribe_nodes)} nodes)"
         )
         self._running = True
+        self._reconnect_backoff = 5
+
+    async def _is_subscription_alive(self) -> bool:
+        if not self._subscription:
+            return False
+        try:
+            return getattr(self._subscription, 'is_active', True)
+        except Exception:
+            return False
+
+    async def _reconnect(self):
+        logger.warning(f"Reconnecting to {self.server_url}...")
+        await self.stop()
+
+        while self._running:
+            try:
+                await self.start()
+                logger.info(f"Reconnect successful: {self.server_url}")
+                self._reconnect_backoff = 5
+                return
+            except Exception as e:
+                logger.error(f"Reconnect failed: {e}, retry in {self._reconnect_backoff}s")
+                await asyncio.sleep(self._reconnect_backoff)
+                self._reconnect_backoff = min(self._reconnect_backoff * 2, self._max_backoff)
+
+    async def _watchdog(self):
+        logger.info(f"Watchdog started for {self.server_url}")
+        while self._running:
+            await asyncio.sleep(10)
+            if not self._running:
+                break
+            alive = await self._is_subscription_alive()
+            if not alive:
+                logger.warning(f"Subscription dead on {self.server_url}, triggering reconnect")
+                await self._reconnect()
+                break
+        logger.info(f"Watchdog stopped for {self.server_url}")
 
     async def run(self):
-        """Цикл ожидания данных (работает пока _running == True)."""
-        logger.info(f"Слушаем данные: {self.server_url}")
+        logger.info(f"Listening for data: {self.server_url}")
+        self._watchdog_task = asyncio.create_task(self._watchdog())
         try:
-            while self._running:
-                await asyncio.sleep(1)
+            await self._watchdog_task
         except asyncio.CancelledError:
-            logger.info(f"Остановка: {self.server_url}")
+            logger.info(f"Stopping: {self.server_url}")
         finally:
             await self.stop()
 
     async def stop(self):
         self._running = False
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
         if self.client:
             try:
                 await self.client.disconnect()
-                logger.info(f"Отключено: {self.server_url}")
+                logger.info(f"Disconnected: {self.server_url}")
             except Exception as e:
-                logger.error(f"Ошибка отключения {self.server_url}: {e}")
+                logger.error(f"Disconnect error {self.server_url}: {e}")

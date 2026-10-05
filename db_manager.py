@@ -1,29 +1,34 @@
 import sqlite3
 
 
-def init_db(db_path: str = "opc_readings.db") -> sqlite3.Connection:
-    """
-    Создаёт структуру БД из четырёх таблиц:
+class DBConnection:
+    def __init__(self, conn: sqlite3.Connection, db_path: str):
+        self._conn = conn
+        self.db_path = db_path
 
-        servers
-          └─ devices          (FK → servers)
-               └─ device_params  (FK → devices)
-                    └─ readings       (FK → device_params)
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
-    Таблица servers        — характеристики OPC UA серверов
-    Таблица devices        — приборы, зарегистрированные на каждом сервере
-                             (имя, объект OPC UA, описание)
-    Таблица device_params  — параметры/узлы каждого прибора,
-                             обнаруженные через OPC UA browsing
-    Таблица readings       — показания: ссылка на параметр прибора +
-                             значение + серверная метка времени
-    """
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
+    def cursor(self):
+        return self._conn.cursor()
 
-    # ------------------------------------------------------------------
-    # 1. Серверы
-    # ------------------------------------------------------------------
+    def commit(self):
+        return self._conn.commit()
+
+    def close(self):
+        return self._conn.close()
+
+    def execute(self, sql, params=()):
+        return self._conn.execute(sql, params)
+
+
+def init_db(db_path: str = "opc_readings.db") -> DBConnection:
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+
     conn.execute('''
         CREATE TABLE IF NOT EXISTS servers (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,11 +40,6 @@ def init_db(db_path: str = "opc_readings.db") -> sqlite3.Connection:
         )
     ''')
 
-    # ------------------------------------------------------------------
-    # 2. Приборы — ссылаются на сервер
-    #    device_key  — идентификатор в системе мониторинга
-    #    object_name — имя объекта на OPC UA сервере (для browsing)
-    # ------------------------------------------------------------------
     conn.execute('''
         CREATE TABLE IF NOT EXISTS devices (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,12 +54,6 @@ def init_db(db_path: str = "opc_readings.db") -> sqlite3.Connection:
         )
     ''')
 
-    # ------------------------------------------------------------------
-    # 3. Параметры (узлы OPC UA) каждого прибора
-    #    node_id    — строковое представление NodeId
-    #    param_name — BrowseName узла
-    #    description, unit — считываются из свойств OPC UA при первом обходе
-    # ------------------------------------------------------------------
     conn.execute('''
         CREATE TABLE IF NOT EXISTS device_params (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,11 +69,6 @@ def init_db(db_path: str = "opc_readings.db") -> sqlite3.Connection:
         )
     ''')
 
-    # ------------------------------------------------------------------
-    # 4. Показания — только ссылка на параметр + значение + серверное время
-    #    server_timestamp — берётся из DataValue.ServerTimestamp OPC UA,
-    #                       при недоступности — клиентское UTC-время
-    # ------------------------------------------------------------------
     conn.execute('''
         CREATE TABLE IF NOT EXISTS readings (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,13 +79,19 @@ def init_db(db_path: str = "opc_readings.db") -> sqlite3.Connection:
         )
     ''')
 
-    # ------------------------------------------------------------------
-    # Индексы для ускорения выборок
-    # ------------------------------------------------------------------
     conn.execute('CREATE INDEX IF NOT EXISTS idx_readings_param    ON readings(device_param_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_readings_ts       ON readings(server_timestamp)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_devices_server    ON devices(server_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_params_device     ON device_params(device_id)')
 
     conn.commit()
-    return conn
+    return DBConnection(conn, db_path)
+
+
+def recreate_connection(db_conn: DBConnection) -> DBConnection:
+    db_path = db_conn.db_path
+    try:
+        db_conn.close()
+    except Exception:
+        pass
+    return init_db(db_path)
