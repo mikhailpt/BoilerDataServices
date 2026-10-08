@@ -7,19 +7,22 @@ def init_db(db_path: str = "opc_readings.db") -> sqlite3.Connection:
 
         servers
           └─ devices          (FK → servers)
-               └─ device_params  (FK → devices)
-                    └─ readings       (FK → device_params)
+                └─ device_params  (FK → devices)
+                     └─ readings       (FK → device_params)
 
     Таблица servers        — характеристики OPC UA серверов
     Таблица devices        — приборы, зарегистрированные на каждом сервере
-                             (имя, объект OPC UA, описание)
+                              (имя, объект OPC UA, описание)
     Таблица device_params  — параметры/узлы каждого прибора,
-                             обнаруженные через OPC UA browsing
+                              обнаруженные через OPC UA browsing
     Таблица readings       — показания: ссылка на параметр прибора +
-                             значение + серверная метка времени
+                              значение + серверная метка времени
     """
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
 
     # ------------------------------------------------------------------
     # 1. Серверы

@@ -194,15 +194,15 @@ class AirAnalyserBonerP23_08_Client:
         return {"success": False, "value": None}
 
 
-air = AirAnalyserBonerP23_08_Client()
-print(air._find_port())
-#for port in serial.tools.list_ports.comports():
-#	print(f'dev={port.device}, vid={port.vid}, pid={port.pid}')
+# air = AirAnalyserBonerP23_08_Client()
+# print(air._find_port())
+# for port in serial.tools.list_ports.comports():
+# 	print(f'dev={port.device}, vid={port.vid}, pid={port.pid}')
 
-#while True:
-all_regs = air._read_registers_sync(0, 57)
-if all_regs and len(all_regs) >= 57:
-    for cmd, start_reg in air.reg_map.items():
-        val = air._regs_to_float(all_regs[start_reg: start_reg+2])
-        print(f'{cmd} => {val}')
+# while True:
+# all_regs = air._read_registers_sync(0, 57)
+# if all_regs and len(all_regs) >= 57:
+#     for cmd, start_reg in air.reg_map.items():
+#         val = air._regs_to_float(all_regs[start_reg: start_reg+2])
+#         print(f'{cmd} => {val}')
 

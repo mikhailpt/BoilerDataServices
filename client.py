@@ -24,46 +24,72 @@ logger = logging.getLogger(__name__)
 # ОБРАБОТЧИК ПОДПИСОК
 # ===========================================================================
 
+class OPCDataWriter:
+    def __init__(self, db_conn: sqlite3.Connection, queue: asyncio.Queue):
+        self.db_conn = db_conn
+        self.queue = queue
+        self.cursor = db_conn.cursor()
+        self._running = True
+        self._lock = threading.Lock()
+
+    async def run(self):
+        logger.info("DB writer запущен")
+        while self._running:
+            try:
+                item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            if item is None:
+                break
+            param_id, value_str, server_ts = item
+            with self._lock:
+                try:
+                    self.cursor.execute(
+                        "INSERT INTO readings (device_param_id, value, server_timestamp) VALUES (?, ?, ?)",
+                        (param_id, value_str, server_ts),
+                    )
+                    self.db_conn.commit()
+                    logger.debug(f"  db write: param_id={param_id} = {value_str!r} [{server_ts}]")
+                except sqlite3.Error as e:
+                    logger.error(f"Ошибка записи в БД: {e}")
+                    try:
+                        self.db_conn.rollback()
+                    except Exception:
+                        pass
+            self.queue.task_done()
+
+    async def stop(self):
+        self._running = False
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
+
+
 class OPCDataHandler:
     """
     Callback-обработчик OPC UA подписок.
 
-    Получает уведомления об изменении значений и записывает их
-    в таблицу readings (device_param_id, value, server_timestamp).
-
-    param_cache: dict  str(node.nodeid) → device_param_id (int)
+    Получает уведомления об изменении значений и ставит их в очередь на запись.
     """
 
-    def __init__(self, db_conn: sqlite3.Connection, param_cache: Dict[str, int]):
-        self.db_conn = db_conn
-        self.cursor = db_conn.cursor()
+    def __init__(self, queue: asyncio.Queue, param_cache: Dict[str, int]):
+        self._queue = queue
         self._cache = param_cache
-        self._lock = threading.Lock()
 
     def datachange_notification(self, node, val, data):
         node_id_str = str(node.nodeid)
-
         if node_id_str not in self._cache:
             logger.debug(f"Неизвестный узел, пропускаем: {node_id_str}")
             return
-
         param_id = self._cache[node_id_str]
-
-        # Серверная метка времени из OPC UA DataValue
         server_ts = _extract_server_timestamp(data)
-
-        with self._lock:
-            try:
-                self.cursor.execute(
-                    "INSERT INTO readings (device_param_id, value, server_timestamp)"
-                    " VALUES (?, ?, ?)",
-                    (param_id, str(val), server_ts),
-                )
-                self.db_conn.commit()
-                logger.info(f"  {node_id_str} = {val!r}  [{server_ts}]")
-            except sqlite3.Error as e:
-                logger.error(f"Ошибка записи в БД: {e}")
-                self.db_conn.rollback()
+        try:
+            self._queue.put_nowait((param_id, str(val), server_ts))
+        except Exception as e:
+            logger.error(f"Ошибка постановки в очередь чтения: {e}")
 
 
 def _extract_server_timestamp(data) -> str:
@@ -285,6 +311,36 @@ class OPCUAServerClient:
     # Запуск / остановка
     # -----------------------------------------------------------------------
 
+    async def _on_connection_lost(self, ex: Exception):
+        logger.warning(f"Потеря соединения с {self.server_url}: {ex}")
+        self._running = False
+
+    async def _cleanup_partial(self):
+        self._running = False
+        if self._subscription:
+            try:
+                await self._subscription.delete()
+            except Exception:
+                pass
+            self._subscription = None
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception as e:
+                logger.debug(f"Ошибка отключения при очистке {self.server_url}: {e}")
+            self.client = None
+        if self._writer:
+            await self._writer.stop()
+        if self._writer_task:
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+        self._writer = None
+        self._writer_task = None
+        self._queue = None
+
     async def start(self):
         """
         1. Подключается к серверу.
@@ -292,6 +348,7 @@ class OPCUAServerClient:
         3. Создаёт подписку на все найденные узлы.
         """
         self.client = Client(self.server_url)
+        self.client.connection_lost_callback = self._on_connection_lost
         await self.client.connect()
         logger.info(f"Подключено к серверу: {self.server_url}")
 
@@ -329,12 +386,18 @@ class OPCUAServerClient:
 
             logger.info(f"  {key}: зарегистрировано {len(nodes_info)} узлов")
 
+        self._queue = asyncio.Queue(maxsize=10000)
+        self._writer = OPCDataWriter(self.db_conn, self._queue)
+        self._writer_task = asyncio.create_task(self._writer.run(), name=f"db-writer-{self.server_id}")
+
         if not subscribe_nodes:
             logger.warning(f"Нет узлов для подписки на {self.server_url}")
+            self._running = True
+            self._last_subscribed = []
             return
 
         # 4. Создать подписку и подписаться на все найденные узлы
-        handler = OPCDataHandler(self.db_conn, param_cache)
+        handler = OPCDataHandler(self._queue, param_cache)
         self._subscription = await self.client.create_subscription(
             self.sampling_ms, handler
         )
@@ -351,14 +414,39 @@ class OPCUAServerClient:
             f"Сервер {self.server_url}: подписки активны"
             f" ({ok_count}/{len(subscribe_nodes)} узлов)"
         )
+        self._last_subscribed = subscribe_nodes
         self._running = True
 
     async def run(self):
-        """Цикл ожидания данных (работает пока _running == True)."""
+        """Цикл ожидания данных с авто-переподключением при потере соединения."""
         logger.info(f"Слушаем данные: {self.server_url}")
+        backoff = 1
         try:
-            while self._running:
-                await asyncio.sleep(1)
+            while True:
+                if not self._running:
+                    try:
+                        await self.start()
+                        backoff = 1
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"Не удалось переподключиться к {self.server_url}: {e}")
+                        await self._cleanup_partial()
+                        await asyncio.sleep(min(backoff, 60))
+                        backoff = min(backoff * 2, 60)
+                        continue
+                try:
+                    if self.client:
+                        await self.client.check_connection()
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Проверка соединения не удалась {self.server_url}: {e}")
+                    self._running = False
+                    await self._cleanup_partial()
+                    await asyncio.sleep(min(backoff, 60))
+                    backoff = min(backoff * 2, 60)
         except asyncio.CancelledError:
             logger.info(f"Остановка: {self.server_url}")
         finally:
@@ -366,9 +454,27 @@ class OPCUAServerClient:
 
     async def stop(self):
         self._running = False
+        if self._subscription:
+            try:
+                await self._subscription.delete()
+            except Exception:
+                pass
+            self._subscription = None
+        if self._writer:
+            await self._writer.stop()
+        if self._writer_task:
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+        self._writer = None
+        self._writer_task = None
+        self._queue = None
         if self.client:
             try:
                 await self.client.disconnect()
                 logger.info(f"Отключено: {self.server_url}")
             except Exception as e:
                 logger.error(f"Ошибка отключения {self.server_url}: {e}")
+            self.client = None
