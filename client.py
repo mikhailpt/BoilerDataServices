@@ -7,17 +7,26 @@ import threading
 
 from asyncua import Client, ua
 
+from node_finder import (
+    OpcNodeFinder,
+    browse_many,
+    datavalue_to_python,
+    read_values_many,
+)
+
 import logging
 
 # ---------------------------------------------------------------------------
 # Логирование
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+_UNREAD_VALUE = object()
 
 
 # ===========================================================================
@@ -117,8 +126,9 @@ class OPCUAServerClient:
     Подключается к одному OPC UA серверу.
 
     Для каждого прибора из devices_config:
-      1. Ищет объект прибора в пространстве Objects по object_name.
-      2. Обходит все дочерние Variable-узлы (browsing).
+      1. Ищет объекты приборов в пространстве Objects по object_name
+         (все имена — за один BFS-проход с пакетными Browse-запросами).
+      2. Обходит все дочерние Variable-узлы (browsing, тоже пакетно).
       3. Регистрирует прибор и его параметры в БД.
       4. Подписывается на изменения найденных узлов.
     """
@@ -139,6 +149,11 @@ class OPCUAServerClient:
         self.client: Optional[Client] = None
         self._subscription = None
         self._running = False
+        self._finder: Optional[OpcNodeFinder] = None
+        self._queue: Optional[asyncio.Queue] = None
+        self._writer: Optional[OPCDataWriter] = None
+        self._writer_task: Optional[asyncio.Task] = None
+        self._last_subscribed: List = []
 
     # -----------------------------------------------------------------------
     # Регистрация в БД
@@ -202,46 +217,129 @@ class OPCUAServerClient:
     # OPC UA: поиск и обход узлов прибора
     # -----------------------------------------------------------------------
     async def _find_device_object(self, object_name: str):
-        objects_node = self.client.nodes.objects
-        return await self._recursive_search(objects_node, object_name, max_depth=10)
+        """
+        Находит объект прибора по BrowseName.
 
-    async def _recursive_search(self, node, object_name: str, max_depth: int = 10, current_depth: int = 0):
-        if current_depth >= max_depth:
+        Тонкая обёртка над OpcNodeFinder (BFS с пакетными Browse-запросами).
+        Основной путь в start() — find_many(), который ищет все приборы
+        за один проход по дереву.
+        """
+        if self.client is None:
             return None
-
-        try:
-            children = await node.get_children()
-        except Exception:
-            return None
-
-        for child in children:
-            try:
-                # Проверяем текущий узел
-                bn = await child.read_browse_name()
-                if bn.Name == object_name:
-                    logger.debug(f"  Найдено на глубине {current_depth + 1}: {bn.Name}")
-                    return child
-
-                # Рекурсивно ищем в детях (если это Object или Variable)
-                node_class = await child.read_node_class()
-                if node_class in (ua.NodeClass.Object, ua.NodeClass.Variable):
-                    found = await self._recursive_search(
-                        child, object_name, max_depth, current_depth + 1
-                    )
-                    if found is not None:
-                        return found
-
-            except Exception:
-                continue
-
-        return None
+        if self._finder is None:
+            self._finder = OpcNodeFinder(self.client, max_depth=10)
+        return await self._finder.find(object_name)
 
     async def _browse_device_nodes(self, device_obj) -> List[dict]:
         """
         Обходит все Variable-узлы прибора (только HasComponent, не свойства).
         Для каждого считывает: node_id, param_name, description, unit, data_type.
         Возвращает список dict с ключом 'node' (объект asyncua.Node).
+
+        Пакетный вариант: Browse имён/свойств + один Read значений на все
+        параметры. При любой ошибке — откат на последовательный обход.
         """
+        try:
+            return await self._browse_device_nodes_batched(device_obj)
+        except Exception as e:
+            logger.warning(f"    Пакетный обход не удался ({e}) — fallback на последовательный")
+            return await self._browse_device_nodes_sequential(device_obj)
+
+    async def _browse_device_nodes_batched(self, device_obj) -> List[dict]:
+        # 1. Variable-дети через HasComponent; если пусто — все hierarchical
+        variable_refs = await self._browse_variable_refs(device_obj)
+        if not variable_refs:
+            variable_refs = await self._browse_variable_refs(
+                device_obj, reference_type=ua.ObjectIds.HierarchicalReferences
+            )
+        if not variable_refs:
+            return []
+
+        variables = []
+        for ref in variable_refs:
+            name = ref.BrowseName.Name if ref.BrowseName is not None else None
+            if not name:
+                continue
+            variables.append((self.client.get_node(ref.NodeId), ref.NodeId, name))
+        if not variables:
+            return []
+
+        # 2. Свойства Description/EngineeringUnits всех переменных — одним Browse
+        variable_ids = [var[1] for var in variables]
+        props_per_var = await browse_many(
+            self.client,
+            variable_ids,
+            reference_type=ua.ObjectIds.HasProperty,
+            include_subtypes=False,
+            node_class_mask=ua.NodeClass.Variable,
+        )
+
+        properties: Dict[str, Dict[str, ua.NodeId]] = {}
+        ids_to_read: List[ua.NodeId] = list(variable_ids)
+        for var_id, prop_refs in zip(variable_ids, props_per_var):
+            mapping: Dict[str, ua.NodeId] = {}
+            for ref in prop_refs:
+                if ref.BrowseName is None:
+                    continue
+                if ref.BrowseName.Name in ("Description", "EngineeringUnits"):
+                    mapping[ref.BrowseName.Name] = ref.NodeId
+                    ids_to_read.append(ref.NodeId)
+            properties[str(var_id)] = mapping
+
+        # 3. Один пакетный Read: значения переменных + значения свойств
+        values = await read_values_many(self.client, ids_to_read)
+
+        result = []
+        for node, var_id, param_name in variables:
+            var_key = str(var_id)
+            data_type_str = "string"
+            data_value = values.get(var_key)
+            if data_value is not None:
+                value = datavalue_to_python(data_value, _UNREAD_VALUE)
+                if value is not _UNREAD_VALUE:
+                    data_type_str = type(value).__name__
+
+            description: Optional[str] = None
+            unit: Optional[str] = None
+            prop_map = properties.get(var_key, {})
+            if "Description" in prop_map:
+                prop_value = datavalue_to_python(values.get(str(prop_map["Description"])))
+                if prop_value is not None:
+                    description = str(prop_value)
+            if "EngineeringUnits" in prop_map:
+                prop_value = datavalue_to_python(values.get(str(prop_map["EngineeringUnits"])))
+                if prop_value is not None:
+                    unit = str(prop_value)
+
+            result.append(
+                {
+                    "node": node,
+                    "node_id": var_key,
+                    "param_name": param_name,
+                    "description": description,
+                    "unit": unit,
+                    "data_type": data_type_str,
+                }
+            )
+            logger.debug(f"    Найден узел: {param_name}  node_id={var_key}")
+
+        return result
+
+    async def _browse_variable_refs(
+        self, device_obj, reference_type: int = ua.ObjectIds.HasComponent
+    ) -> List[ua.ReferenceDescription]:
+        """Пакетно читает ссылки на Variable-узлы прибора."""
+        batches = await browse_many(
+            self.client,
+            [device_obj.nodeid],
+            reference_type=reference_type,
+            include_subtypes=True,
+            node_class_mask=ua.NodeClass.Variable,
+        )
+        return batches[0] if batches else []
+
+    async def _browse_device_nodes_sequential(self, device_obj) -> List[dict]:
+        """Последовательный обход (прежняя реализация) — резервный путь."""
         # Пробуем получить только Variable-дочерние узлы через HasComponent
         try:
             children = await device_obj.get_children(
@@ -270,7 +368,6 @@ class OPCUAServerClient:
                 data_type_str: str = "string"
 
                 # Свойства узла: Description и EngineeringUnits
-                # (добавляются в device_instance.py через node.add_property)
                 try:
                     props = await node.get_properties()
                     for prop in props:
@@ -292,7 +389,7 @@ class OPCUAServerClient:
 
                 result.append(
                     {
-                        "node": node,               # объект Node для подписки
+                        "node": node,
                         "node_id": node_id_str,
                         "param_name": bn.Name,
                         "description": description,
@@ -317,6 +414,7 @@ class OPCUAServerClient:
 
     async def _cleanup_partial(self):
         self._running = False
+        self._finder = None
         if self._subscription:
             try:
                 await self._subscription.delete()
@@ -344,8 +442,9 @@ class OPCUAServerClient:
     async def start(self):
         """
         1. Подключается к серверу.
-        2. Для каждого прибора: browsing → регистрация в БД.
-        3. Создаёт подписку на все найденные узлы.
+        2. Одним проходом находит объекты всех приборов.
+        3. Для каждого прибора: browsing параметров → регистрация в БД.
+        4. Создаёт подписку на все найденные узлы.
         """
         self.client = Client(self.server_url)
         self.client.connection_lost_callback = self._on_connection_lost
@@ -355,6 +454,17 @@ class OPCUAServerClient:
         param_cache: Dict[str, int] = {}    # node_id_str → device_param_id
         subscribe_nodes: List = []          # Node-объекты для подписки
 
+        # 1. Найти объекты всех приборов за один обход дерева (BFS + батчи)
+        self._finder = OpcNodeFinder(self.client, max_depth=10)
+        object_names = [cfg["object_name"] for cfg in self.devices_config]
+        found_objects = await self._finder.find_many(object_names)
+        stats = self._finder.last_stats
+        logger.info(
+            f"  Поиск объектов: найдено {len(found_objects)}/{len(set(object_names))}"
+            f" за {stats.get('elapsed_ms', 0.0):.1f} мс"
+            f" (просмотрено {stats.get('nodes_browsed', 0)} узлов)"
+        )
+
         for dev_cfg in self.devices_config:
             key = dev_cfg["key"]
             obj_name = dev_cfg["object_name"]
@@ -362,8 +472,8 @@ class OPCUAServerClient:
 
             logger.info(f"  Обход прибора: {key!r}  (OPC UA объект: {obj_name!r})")
 
-            # 1. Найти объект прибора на сервере
-            device_obj = await self._find_device_object(obj_name)
+            # Объект прибора из общего результата поиска
+            device_obj = found_objects.get(obj_name)
             if device_obj is None:
                 logger.warning(
                     f"  Объект {obj_name!r} не найден на {self.server_url} — пропускаем"
@@ -471,6 +581,7 @@ class OPCUAServerClient:
         self._writer = None
         self._writer_task = None
         self._queue = None
+        self._finder = None
         if self.client:
             try:
                 await self.client.disconnect()
